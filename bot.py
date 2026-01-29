@@ -3,6 +3,7 @@ import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 from dotenv import load_dotenv
 import config
 
@@ -73,10 +74,28 @@ async def main() -> None:
         logger.error("❌ Ошибка: BOT_TOKEN не найден в .env файле!")
         return
     
+    # Настраиваем HTTPXRequest с увеличенными таймаутами
+    # Это помогает избежать ошибок при медленном соединении
+    request_kwargs = {
+        'connection_pool_size': 8,
+        'connect_timeout': config.NETWORK_TIMEOUT['connect'],
+        'read_timeout': config.NETWORK_TIMEOUT['read'],
+        'write_timeout': config.NETWORK_TIMEOUT['write'],
+        'pool_timeout': config.NETWORK_TIMEOUT['pool']
+    }
+    
+    # Добавляем прокси, если он настроен
+    if config.PROXY_URL:
+        request_kwargs['proxy'] = config.PROXY_URL
+        logger.info(f"🔒 Используется прокси: {config.PROXY_URL}")
+    
+    request = HTTPXRequest(**request_kwargs)
+    
     # Создаем асинхронное приложение с оптимизированными настройками
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .request(request)  # Используем настроенный request с увеличенными таймаутами
         .concurrent_updates(True)  # Включаем параллельную обработку обновлений
         .post_init(post_init)
         .post_shutdown(post_shutdown)
@@ -87,14 +106,41 @@ async def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_error_handler(error_handler)
     
-    # Запускаем бота асинхронно
+    
+    # Запускаем бота асинхронно с повторными попытками при ошибках сети
     logger.info("🚀 Запуск бота...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True  # Игнорируем старые обновления при запуске
-    )
+    
+    max_retries = config.MAX_RETRIES
+    retry_delay = config.RETRY_DELAY
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True  # Игнорируем старые обновления при запуске
+            )
+            break  # Успешный запуск, выходим из цикла
+            
+        except Exception as e:
+            logger.error(f"❌ Попытка {attempt}/{max_retries} не удалась: {e}")
+            
+            if attempt < max_retries:
+                logger.info(f"⏳ Повторная попытка через {retry_delay} секунд...")
+                await asyncio.sleep(retry_delay)
+                retry_delay += 5  # Увеличиваем задержку для следующей попытки
+            else:
+                logger.error("❌ Не удалось запустить бота после всех попыток")
+                logger.error("💡 Возможные причины:")
+                logger.error("   1. Проблемы с интернет-соединением")
+                logger.error("   2. Telegram API недоступен в вашем регионе")
+                logger.error("   3. Неверный BOT_TOKEN")
+                logger.error("💡 Попробуйте:")
+                logger.error("   1. Проверить интернет-соединение")
+                logger.error("   2. Использовать VPN или прокси")
+                logger.error("   3. Проверить правильность BOT_TOKEN в .env файле")
+                return
     
     # Держим бота запущенным
     try:
